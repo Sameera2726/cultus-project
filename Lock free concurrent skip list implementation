@@ -1,554 +1,700 @@
-from __future__ import annotations
-
-import random
-import threading
-from dataclasses import dataclass, field
-from typing import Any, Optional, List
-
-
-MAX_LEVEL = 16
-P = 0.5
-
-
-def _random_level() -> int:
-    level = 1
-    while random.random() < P and level < MAX_LEVEL:
-        level += 1
-    return level
-
-
-class Node:
-
-    __slots__ = ("key", "value", "next", "marked", "fully_linked", "lock", "top_level")
-
-    def __init__(self, key, value, level: int):
-        self.key = key
-        self.value = value
-        self.next: List[Optional["Node"]] = [None] * level
-        self.marked = False
-        self.fully_linked = False
-        self.lock = threading.Lock()
-
-
-        self.top_level = level - 1
-
-    def cas_next(self, level: int, expected: Optional["Node"], new: Optional["Node"]) -> bool:
-        with self.lock:
-            if self.next[level] is expected:
-                self.next[level] = new
-                return True
-            return False
-
-
-class _NegInf:
-    def __lt__(self, other): return True
-    def __le__(self, other): return True
-    def __gt__(self, other): return False
-    def __ge__(self, other): return other is self
-    def __eq__(self, other): return other is self
-    def __repr__(self): return "-inf"
-    def __hash__(self): return hash("_NegInf_sentinel")
-
-
-class _PosInf:
-    def __lt__(self, other): return False
-    def __le__(self, other): return other is self
-    def __gt__(self, other): return True
-    def __ge__(self, other): return True
-    def __eq__(self, other): return other is self
-    def __repr__(self): return "+inf"
-    def __hash__(self): return hash("_PosInf_sentinel")
-
-
-NEG_INF = _NegInf()
-POS_INF = _PosInf()
-
-
-class ConcurrentSkipList:
-
-    def __init__(self, max_level: int = MAX_LEVEL):
-        self.max_level = max_level
-        self.head = Node(NEG_INF, None, max_level)
-        self.tail = Node(POS_INF, None, max_level)
-        for i in range(max_level):
-            self.head.next[i] = self.tail
-        self.head.fully_linked = True
-        self.tail.fully_linked = True
-
-
-        self._size = 0
-        self._size_lock = threading.Lock()
-
-
-    def _find(self, key, preds: List[Node], succs: List[Node]) -> int:
-        found_level = -1
-        pred = self.head
-        for level in range(self.max_level - 1, -1, -1):
-            curr = pred.next[level]
-            while curr.key < key:
-                pred = curr
-                curr = pred.next[level]
-            if found_level == -1 and curr.key == key and not curr.marked:
-                found_level = level
-            preds[level] = pred
-            succs[level] = curr
-        return found_level
-
-
-    def contains(self, key) -> bool:
-        pred = self.head
-        for level in range(self.max_level - 1, -1, -1):
-            curr = pred.next[level]
-            while curr.key < key:
-                pred = curr
-                curr = pred.next[level]
-            if curr.key == key:
-                return (not curr.marked) and curr.fully_linked
-        return False
-
-    def get(self, key) -> Any:
-        pred = self.head
-        for level in range(self.max_level - 1, -1, -1):
-            curr = pred.next[level]
-            while curr.key < key:
-                pred = curr
-                curr = pred.next[level]
-            if curr.key == key and not curr.marked and curr.fully_linked:
-                return curr.value
-        return None
-
-    def insert(self, key, value) -> bool:
-        top_level = _random_level()
-        preds: List[Optional[Node]] = [None] * self.max_level
-        succs: List[Optional[Node]] = [None] * self.max_level
-
-        while True:
-            found_level = self._find(key, preds, succs)
-            if found_level != -1:
-                existing = succs[found_level]
-                if not existing.marked:
-
-
-                    existing.value = value
-                    return False
-
-                continue
-
-            new_node = Node(key, value, top_level)
-            for level in range(top_level):
-                new_node.next[level] = succs[level]
-
-
-            pred0, succ0 = preds[0], succs[0]
-            if not pred0.cas_next(0, succ0, new_node):
-                continue
-
-
-            for level in range(1, top_level):
-                while True:
-                    pred, succ = preds[level], succs[level]
-                    new_node.next[level] = succ
-                    if pred.cas_next(level, succ, new_node):
-                        break
-
-                    self._find(key, preds, succs)
-
-            new_node.fully_linked = True
-            with self._size_lock:
-                self._size += 1
-            return True
-
-    def delete(self, key) -> bool:
-        preds: List[Optional[Node]] = [None] * self.max_level
-        succs: List[Optional[Node]] = [None] * self.max_level
-
-        while True:
-            found_level = self._find(key, preds, succs)
-            if found_level == -1:
-                return False
-
-            victim = succs[found_level]
-            if victim.marked or not victim.fully_linked:
-                return False
-
-
-            with victim.lock:
-                if victim.marked:
-                    return False
-                victim.marked = True
-
-
-            for level in range(victim.top_level, -1, -1):
-                while True:
-                    pred = preds[level]
-                    if pred.next[level] is victim:
-                        if pred.cas_next(level, victim, victim.next[level]):
-                            break
-                        else:
-                            self._find(key, preds, succs)
-                    else:
-                        break
-
-            with self._size_lock:
-                self._size -= 1
-            return True
-
-    def __len__(self) -> int:
-        return self._size
-
-    def to_sorted_list(self) -> List[Any]:
-        result = []
-        curr = self.head.next[0]
-        while curr is not self.tail:
-            if not curr.marked and curr.fully_linked:
-                result.append((curr.key, curr.value))
-            curr = curr.next[0]
-        return result
-
-    def is_sorted_and_consistent(self) -> bool:
-        keys = [k for k, _ in self.to_sorted_list()]
-        return all(keys[i] < keys[i + 1] for i in range(len(keys) - 1))
-
-
-import random
-import threading
-import unittest
-from concurrent.futures import ThreadPoolExecutor
-
-
-class TestSequentialCorrectness(unittest.TestCase):
-    def setUp(self):
-        self.sl = ConcurrentSkipList()
-
-    def test_insert_and_contains(self):
-        self.assertTrue(self.sl.insert(5, "five"))
-        self.assertTrue(self.sl.contains(5))
-        self.assertFalse(self.sl.contains(6))
-
-    def test_insert_duplicate_updates_value(self):
-        self.assertTrue(self.sl.insert(1, "a"))
-        self.assertFalse(self.sl.insert(1, "b"))
-        self.assertEqual(self.sl.get(1), "b")
-
-    def test_delete_existing(self):
-        self.sl.insert(3, "three")
-        self.assertTrue(self.sl.delete(3))
-        self.assertFalse(self.sl.contains(3))
-
-    def test_delete_nonexistent(self):
-        self.assertFalse(self.sl.delete(999))
-
-    def test_sorted_order(self):
-        values = [50, 10, 40, 20, 30, 5, 45]
-        for v in values:
-            self.sl.insert(v, str(v))
-        self.assertEqual([k for k, _ in self.sl.to_sorted_list()], sorted(values))
-
-    def test_len_tracks_inserts_and_deletes(self):
-        for i in range(100):
-            self.sl.insert(i, i)
-        self.assertEqual(len(self.sl), 100)
-        for i in range(0, 100, 2):
-            self.sl.delete(i)
-        self.assertEqual(len(self.sl), 50)
-
-    def test_structural_invariant_after_many_ops(self):
-        keys = list(range(500))
-        random.shuffle(keys)
-        for k in keys:
-            self.sl.insert(k, k)
-        random.shuffle(keys)
-        for k in keys[:250]:
-            self.sl.delete(k)
-        self.assertTrue(self.sl.is_sorted_and_consistent())
-
-
-class TestConcurrentCorrectness(unittest.TestCase):
-
-    def test_concurrent_inserts_no_loss_no_duplicates(self):
-        sl = ConcurrentSkipList()
-        n_threads = 16
-        keys_per_thread = 500
-        total_keys = n_threads * keys_per_thread
-
-        def worker(tid):
-            for i in range(keys_per_thread):
-                key = tid * keys_per_thread + i
-                sl.insert(key, key * 10)
-
-        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        self.assertEqual(len(sl), total_keys)
-        pairs = sl.to_sorted_list()
-        keys = [k for k, _ in pairs]
-        self.assertEqual(keys, sorted(keys))
-        self.assertEqual(len(keys), len(set(keys)))
-        for k, v in pairs:
-            self.assertEqual(v, k * 10)
-
-    def test_concurrent_insert_and_delete_disjoint_sets(self):
-        sl = ConcurrentSkipList()
-        n = 4000
-        for i in range(n):
-            sl.insert(i, i)
-
-        to_delete = set(range(0, n, 2))
-        to_keep = set(range(1, n, 2))
-
-        def deleter():
-            for k in to_delete:
-                sl.delete(k)
-
-        def inserter():
-            for k in range(n, n + 2000):
-                sl.insert(k, k)
-
-        threads = [threading.Thread(target=deleter) for _ in range(4)]
-        threads += [threading.Thread(target=inserter) for _ in range(4)]
-        random.shuffle(threads)
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        remaining = set(k for k, _ in sl.to_sorted_list())
-
-        self.assertTrue(remaining.isdisjoint(to_delete))
-
-        self.assertTrue(to_keep.issubset(remaining))
-        self.assertTrue(sl.is_sorted_and_consistent())
-
-    def test_concurrent_mixed_workload_stress(self):
-        sl = ConcurrentSkipList()
-        key_space = 200
-        ops_per_thread = 3000
-        n_threads = 12
-
-        def worker():
-            rnd = random.Random()
-            for _ in range(ops_per_thread):
-                key = rnd.randrange(key_space)
-                choice = rnd.random()
-                if choice < 0.4:
-                    sl.insert(key, key)
-                elif choice < 0.7:
-                    sl.delete(key)
-                else:
-                    sl.contains(key)
-
-        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        self.assertTrue(sl.is_sorted_and_consistent())
-        pairs = sl.to_sorted_list()
-        keys = [k for k, _ in pairs]
-        self.assertEqual(len(keys), len(set(keys)))
-        for k, v in pairs:
-            self.assertEqual(k, v)
-
-    def test_no_deadlock_under_thread_pool(self):
-        sl = ConcurrentSkipList()
-
-        def op(i):
-            sl.insert(i, i)
-            sl.contains(i)
-            if i % 3 == 0:
-                sl.delete(i)
-            return True
-
-        with ThreadPoolExecutor(max_workers=32) as ex:
-            results = list(ex.map(op, range(5000)))
-        self.assertTrue(all(results))
-        self.assertTrue(sl.is_sorted_and_consistent())
-
-
-import random
-import threading
-import time
-from statistics import mean
-
-
-class CoarseLockSkipList:
-
-    def __init__(self):
-        self._sl = ConcurrentSkipList()
-        self._lock = threading.Lock()
-
-    def insert(self, k, v):
-        with self._lock:
-            return self._sl.insert(k, v)
-
-    def delete(self, k):
-        with self._lock:
-            return self._sl.delete(k)
-
-    def contains(self, k):
-        with self._lock:
-            return self._sl.contains(k)
-
-    def __len__(self):
-        with self._lock:
-            return len(self._sl)
-
-
-class LockedDict:
-
-    def __init__(self):
-        self._d = {}
-        self._lock = threading.Lock()
-
-    def insert(self, k, v):
-        with self._lock:
-            existed = k in self._d
-            self._d[k] = v
-            return not existed
-
-    def delete(self, k):
-        with self._lock:
-            if k in self._d:
-                del self._d[k]
-                return True
-            return False
-
-    def contains(self, k):
-        with self._lock:
-            return k in self._d
-
-    def __len__(self):
-        with self._lock:
-            return len(self._d)
-
-
-def run_workload(structure, n_threads, ops_per_thread, read_ratio, key_space):
-    barrier = threading.Barrier(n_threads)
-
-    def worker(seed):
-        rnd = random.Random(seed)
-        barrier.wait()
-        for _ in range(ops_per_thread):
-            key = rnd.randrange(key_space)
-            r = rnd.random()
-            if r < read_ratio:
-                structure.contains(key)
-            elif r < read_ratio + (1 - read_ratio) / 2:
-                structure.insert(key, key)
-            else:
-                structure.delete(key)
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
-    start = time.perf_counter()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    elapsed = time.perf_counter() - start
-
-    total_ops = n_threads * ops_per_thread
-    return total_ops / elapsed
-
-
-def main():
-    thread_counts = [1, 2, 4, 8, 16]
-    read_ratios = [0.9, 0.5, 0.1]
-    ops_per_thread = 4000
-    key_space = 2000
-    repeats = 3
-
-    implementations = {
-        "ConcurrentSkipList (fine-grained)": ConcurrentSkipList,
-        "CoarseLockSkipList (baseline)": CoarseLockSkipList,
-        "LockedDict (stdlib-style baseline)": LockedDict,
+#include <atomic>
+#include <cstdint>
+#include <random>
+#include <functional>
+#include <mutex>
+#include <vector>
+#include <thread>
+#include <set>
+#include <iostream>
+#include <cassert>
+#include <algorithm>
+#include <unordered_set>
+#include <chrono>
+#include <cstdio>
+
+constexpr int MAX_LEVEL = 24;
+constexpr size_t RETIRE_THRESHOLD = 128;
+
+template <typename Node>
+class EpochReclaimer {
+public:
+    struct ThreadRecord {
+        std::atomic<uint64_t> announced{0};
+        std::vector<std::pair<Node*, uint64_t>> retired;
+    };
+
+    static EpochReclaimer& instance() {
+        static EpochReclaimer inst;
+        return inst;
     }
 
-    results = {}
+    ThreadRecord& myRecord() {
+        thread_local ThreadRecord* rec = nullptr;
+        if (!rec) {
+            rec = new ThreadRecord();
+            std::lock_guard<std::mutex> lk(registryMutex_);
+            registry_.push_back(rec);
+        }
+        return *rec;
+    }
 
-    for name, ctor in implementations.items():
-        results[name] = {}
-        for ratio in read_ratios:
-            results[name][ratio] = {}
-            for n_threads in thread_counts:
-                samples = []
-                for _ in range(repeats):
-                    structure = ctor()
+    void enter() {
+        auto& rec = myRecord();
+        uint64_t v = globalVersion_.load(std::memory_order_relaxed);
+        rec.announced.store(v, std::memory_order_seq_cst);
+    }
 
-                    for i in range(key_space // 2):
-                        structure.insert(i, i)
-                    throughput = run_workload(
-                        structure, n_threads, ops_per_thread, ratio, key_space
-                    )
-                    samples.append(throughput)
-                results[name][ratio][n_threads] = mean(samples)
+    void exit() {
+        myRecord().announced.store(0, std::memory_order_seq_cst);
+    }
 
-    print_report(results, thread_counts, read_ratios)
-    write_ascii_charts(results, thread_counts, read_ratios)
+    void retire(Node* node) {
+        auto& rec = myRecord();
+        uint64_t v = globalVersion_.load(std::memory_order_relaxed);
+        rec.retired.emplace_back(node, v);
+        if (rec.retired.size() >= RETIRE_THRESHOLD) reclaim();
+    }
 
+    ~EpochReclaimer() {
+        for (auto* rec : registry_) {
+            for (auto& p : rec->retired) delete p.first;
+            delete rec;
+        }
+    }
 
-def print_report(results, thread_counts, read_ratios):
-    for name, by_ratio in results.items():
-        print(f"\n=== {name} ===")
-        for ratio in read_ratios:
-            print(f"  read_ratio={ratio}")
-            for n_threads in thread_counts:
-                tp = by_ratio[ratio][n_threads]
-                print(f"    threads={n_threads:>2}  throughput={tp:>10.0f} ops/sec")
+private:
+    void reclaim() {
+        auto& rec = myRecord();
+        globalVersion_.fetch_add(1, std::memory_order_acq_rel);
 
+        uint64_t minActive = UINT64_MAX;
+        {
+            std::lock_guard<std::mutex> lk(registryMutex_);
+            for (auto* other : registry_) {
+                uint64_t v = other->announced.load(std::memory_order_seq_cst);
+                if (v != 0 && v < minActive) minActive = v;
+            }
+        }
 
-def write_ascii_charts(results, thread_counts, read_ratios, path="benchmark_results.txt"):
-    lines = []
-    lines.append("LOCK-FREE-STRUCTURED SKIP LIST -- BENCHMARK RESULTS (ASCII)")
-    lines.append("=" * 70)
-    lines.append("")
-    lines.append("Environment note: results reflect CPython + GIL scheduling")
-    lines.append("overhead, NOT true multicore scalability. See technical report.")
-    lines.append("")
+        std::vector<std::pair<Node*, uint64_t>> keep;
+        keep.reserve(rec.retired.size());
+        for (auto& e : rec.retired) {
+            if (e.second < minActive) delete e.first;
+            else keep.push_back(e);
+        }
+        rec.retired.swap(keep);
+    }
 
-    for ratio in read_ratios:
-        lines.append(f"--- Read ratio = {ratio} (throughput in ops/sec, higher = better) ---")
-        max_tp = max(
-            results[name][ratio][t]
-            for name in results
-            for t in thread_counts
-        )
-        bar_width = 50
-        for name in results:
-            lines.append(f"\n{name}:")
-            for n_threads in thread_counts:
-                tp = results[name][ratio][n_threads]
-                bar_len = int((tp / max_tp) * bar_width) if max_tp > 0 else 0
-                bar = "#" * bar_len
-                lines.append(f"  {n_threads:>2} threads | {bar:<{bar_width}} {tp:>9.0f} ops/s")
-        lines.append("")
+    std::atomic<uint64_t> globalVersion_{1};
+    std::mutex registryMutex_;
+    std::vector<ThreadRecord*> registry_;
+};
 
-    text = "\n".join(lines)
-    with open(path, "w") as f:
-        f.write(text)
-    print(f"\nWrote ASCII chart report to {path}")
+template <typename Node>
+class EpochGuard {
+public:
+    explicit EpochGuard(EpochReclaimer<Node>& d) : domain_(d) { domain_.enter(); }
+    ~EpochGuard() { domain_.exit(); }
+private:
+    EpochReclaimer<Node>& domain_;
+};
 
+template <typename K, typename V, typename Compare = std::less<K>>
+class LockFreeSkipList {
+public:
+    struct Node {
+        K key;
+        V value;
+        int topLevel;
+        std::atomic<uintptr_t>* next;
 
-if __name__ == "__main__":
-    import sys as _sys
+        Node(const K& k, const V& v, int level) : key(k), value(v), topLevel(level) {
+            next = new std::atomic<uintptr_t>[level + 1];
+            for (int i = 0; i <= level; ++i)
+                next[i].store(pack(nullptr, false), std::memory_order_relaxed);
+        }
+        ~Node() { delete[] next; }
+    };
 
-    mode = _sys.argv[1] if len(_sys.argv) > 1 else "all"
+    LockFreeSkipList() : size_(0) {
+        head_ = new Node(K{}, V{}, MAX_LEVEL - 1);
+    }
 
-    if mode in ("test", "all"):
-        print("=" * 70)
-        print("RUNNING CORRECTNESS + CONCURRENCY TEST SUITE")
-        print("=" * 70)
-        _suite = unittest.TestLoader().loadTestsFromModule(_sys.modules[__name__])
-        _runner = unittest.TextTestRunner(verbosity=2)
-        _result = _runner.run(_suite)
-        if not _result.wasSuccessful():
-            _sys.exit(1)
+    ~LockFreeSkipList() {
+        Node* curr = unpackPtr(head_->next[0].load(std::memory_order_relaxed));
+        while (curr) {
+            Node* next = unpackPtr(curr->next[0].load(std::memory_order_relaxed));
+            delete curr;
+            curr = next;
+        }
+        delete head_;
+    }
 
-    if mode in ("benchmark", "all"):
-        print("\n" + "=" * 70)
-        print("RUNNING THROUGHPUT BENCHMARK")
-        print("=" * 70)
-        main()
+    LockFreeSkipList(const LockFreeSkipList&) = delete;
+    LockFreeSkipList& operator=(const LockFreeSkipList&) = delete;
+
+    bool insert(const K& key, const V& value) {
+        EpochGuard<Node> guard(EpochReclaimer<Node>::instance());
+        int topLevel = randomLevel();
+        Node* preds[MAX_LEVEL];
+        Node* succs[MAX_LEVEL];
+
+        while (true) {
+            if (find(key, preds, succs)) return false;
+
+            Node* newNode = new Node(key, value, topLevel);
+            for (int i = 0; i <= topLevel; ++i)
+                newNode->next[i].store(pack(succs[i], false), std::memory_order_relaxed);
+
+            uintptr_t expected = pack(succs[0], false);
+            uintptr_t desired = pack(newNode, false);
+            if (!preds[0]->next[0].compare_exchange_strong(
+                    expected, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                delete newNode;
+                continue;
+            }
+
+            for (int level = 1; level <= topLevel; ++level) {
+                while (true) {
+                    uintptr_t exp = pack(succs[level], false);
+                    uintptr_t des = pack(newNode, false);
+                    if (preds[level]->next[level].compare_exchange_strong(
+                            exp, des, std::memory_order_acq_rel, std::memory_order_acquire))
+                        break;
+                    find(key, preds, succs);
+                    if (isMarked(newNode->next[0].load(std::memory_order_acquire))) goto done;
+                }
+            }
+        done:
+            size_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+
+    bool remove(const K& key) {
+        EpochGuard<Node> guard(EpochReclaimer<Node>::instance());
+        Node* preds[MAX_LEVEL];
+        Node* succs[MAX_LEVEL];
+
+        if (!find(key, preds, succs)) return false;
+        Node* target = succs[0];
+
+        for (int level = target->topLevel; level >= 1; --level) {
+            uintptr_t raw = target->next[level].load(std::memory_order_acquire);
+            while (!isMarked(raw)) {
+                uintptr_t desired = pack(unpackPtr(raw), true);
+                if (target->next[level].compare_exchange_weak(
+                        raw, desired, std::memory_order_acq_rel, std::memory_order_acquire))
+                    break;
+            }
+        }
+
+        uintptr_t raw0 = target->next[0].load(std::memory_order_acquire);
+        while (true) {
+            if (isMarked(raw0)) return false;
+            uintptr_t desired = pack(unpackPtr(raw0), true);
+            if (target->next[0].compare_exchange_weak(
+                    raw0, desired, std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
+
+        find(key, preds, succs);
+        size_.fetch_sub(1, std::memory_order_relaxed);
+        EpochReclaimer<Node>::instance().retire(target);
+        return true;
+    }
+
+    bool contains(const K& key) const {
+        EpochGuard<Node> guard(EpochReclaimer<Node>::instance());
+        Node* pred = head_;
+        Node* curr = nullptr;
+        for (int level = MAX_LEVEL - 1; level >= 0; --level) {
+            curr = unpackPtr(pred->next[level].load(std::memory_order_acquire));
+            while (curr != nullptr) {
+                uintptr_t raw = curr->next[level].load(std::memory_order_acquire);
+                if (isMarked(raw)) {
+                    curr = unpackPtr(raw);
+                    continue;
+                }
+                if (less_(curr->key, key)) {
+                    pred = curr;
+                    curr = unpackPtr(pred->next[level].load(std::memory_order_acquire));
+                } else break;
+            }
+        }
+        return curr != nullptr && !less_(key, curr->key) && !less_(curr->key, key);
+    }
+
+    size_t size() const { return size_.load(std::memory_order_relaxed); }
+
+    void forEach(const std::function<void(const K&, const V&)>& fn) const {
+        Node* curr = unpackPtr(head_->next[0].load(std::memory_order_acquire));
+        while (curr) {
+            uintptr_t raw = curr->next[0].load(std::memory_order_acquire);
+            if (!isMarked(raw)) fn(curr->key, curr->value);
+            curr = unpackPtr(raw);
+        }
+    }
+
+private:
+    static uintptr_t pack(Node* p, bool mark) {
+        return (reinterpret_cast<uintptr_t>(p) & ~uintptr_t(1)) | (mark ? 1u : 0u);
+    }
+    static Node* unpackPtr(uintptr_t v) { return reinterpret_cast<Node*>(v & ~uintptr_t(1)); }
+    static bool isMarked(uintptr_t v) { return (v & 1u) != 0; }
+
+    int randomLevel() {
+        thread_local std::mt19937_64 gen(std::random_device{}());
+        thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+        int level = 0;
+        while (dist(gen) < 0.5 && level < MAX_LEVEL - 1) ++level;
+        return level;
+    }
+
+    bool find(const K& key, Node** preds, Node** succs) {
+    retry:
+        Node* pred = head_;
+        for (int level = MAX_LEVEL - 1; level >= 0; --level) {
+            uintptr_t predNextRaw = pred->next[level].load(std::memory_order_acquire);
+            Node* curr = unpackPtr(predNextRaw);
+
+            while (true) {
+                if (curr == nullptr) break;
+
+                uintptr_t currNextRaw = curr->next[level].load(std::memory_order_acquire);
+                Node* succ = unpackPtr(currNextRaw);
+
+                if (isMarked(currNextRaw)) {
+                    uintptr_t expected = pack(curr, false);
+                    uintptr_t desired = pack(succ, false);
+                    if (!pred->next[level].compare_exchange_strong(
+                            expected, desired, std::memory_order_acq_rel, std::memory_order_acquire))
+                        goto retry;
+                    curr = succ;
+                    continue;
+                }
+
+                if (less_(curr->key, key)) {
+                    pred = curr;
+                    curr = succ;
+                } else break;
+            }
+            preds[level] = pred;
+            succs[level] = curr;
+        }
+        Node* result = succs[0];
+        return result != nullptr && !less_(key, result->key) && !less_(result->key, key);
+    }
+
+    Node* head_;
+    std::atomic<size_t> size_;
+    Compare less_;
+};
+
+template <typename K, typename V, typename Compare = std::less<K>>
+class LockedSkipList {
+public:
+    struct Node {
+        K key;
+        V value;
+        int topLevel;
+        Node** next;
+        Node(const K& k, const V& v, int level) : key(k), value(v), topLevel(level) {
+            next = new Node*[level + 1];
+            for (int i = 0; i <= level; ++i) next[i] = nullptr;
+        }
+        ~Node() { delete[] next; }
+    };
+
+    LockedSkipList() : size_(0) { head_ = new Node(K{}, V{}, MAX_LEVEL - 1); }
+    ~LockedSkipList() {
+        Node* curr = head_->next[0];
+        while (curr) { Node* n = curr->next[0]; delete curr; curr = n; }
+        delete head_;
+    }
+    LockedSkipList(const LockedSkipList&) = delete;
+    LockedSkipList& operator=(const LockedSkipList&) = delete;
+
+    bool insert(const K& key, const V& value) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        Node* preds[MAX_LEVEL];
+        Node* curr = nullptr;
+        Node* pred = head_;
+        for (int level = MAX_LEVEL - 1; level >= 0; --level) {
+            curr = pred->next[level];
+            while (curr && less_(curr->key, key)) { pred = curr; curr = curr->next[level]; }
+            preds[level] = pred;
+        }
+        if (curr && !less_(key, curr->key) && !less_(curr->key, key)) return false;
+        int topLevel = randomLevel();
+        Node* n = new Node(key, value, topLevel);
+        for (int level = 0; level <= topLevel; ++level) {
+            n->next[level] = preds[level]->next[level];
+            preds[level]->next[level] = n;
+        }
+        ++size_;
+        return true;
+    }
+
+    bool remove(const K& key) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        Node* preds[MAX_LEVEL];
+        Node* curr = nullptr;
+        Node* pred = head_;
+        for (int level = MAX_LEVEL - 1; level >= 0; --level) {
+            curr = pred->next[level];
+            while (curr && less_(curr->key, key)) { pred = curr; curr = curr->next[level]; }
+            preds[level] = pred;
+        }
+        if (!curr || less_(key, curr->key) || less_(curr->key, key)) return false;
+        for (int level = 0; level <= curr->topLevel; ++level)
+            if (preds[level]->next[level] == curr) preds[level]->next[level] = curr->next[level];
+        delete curr;
+        --size_;
+        return true;
+    }
+
+    bool contains(const K& key) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        Node* pred = head_;
+        Node* curr = nullptr;
+        for (int level = MAX_LEVEL - 1; level >= 0; --level) {
+            curr = pred->next[level];
+            while (curr && less_(curr->key, key)) { pred = curr; curr = curr->next[level]; }
+        }
+        return curr != nullptr && !less_(key, curr->key) && !less_(curr->key, key);
+    }
+
+    size_t size() const { std::lock_guard<std::mutex> lk(mutex_); return size_; }
+
+private:
+    int randomLevel() {
+        thread_local std::mt19937_64 gen(std::random_device{}());
+        thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+        int level = 0;
+        while (dist(gen) < 0.5 && level < MAX_LEVEL - 1) ++level;
+        return level;
+    }
+
+    Node* head_;
+    size_t size_;
+    mutable std::mutex mutex_;
+    Compare less_;
+};
+
+static std::atomic<int> g_pass{0};
+static std::atomic<int> g_fail{0};
+
+#define CHECK(cond) do { \
+    if (cond) g_pass.fetch_add(1, std::memory_order_relaxed); \
+    else { g_fail.fetch_add(1, std::memory_order_relaxed); \
+           std::cerr << "FAIL: " << #cond << " at line " << __LINE__ << "\n"; } \
+} while (0)
+
+void test_single_threaded_basic() {
+    LockFreeSkipList<int, std::string> sl;
+
+    CHECK(sl.insert(5, "five") == true);
+    CHECK(sl.insert(3, "three") == true);
+    CHECK(sl.insert(8, "eight") == true);
+    CHECK(sl.insert(1, "one") == true);
+    CHECK(sl.insert(9, "nine") == true);
+
+    CHECK(sl.contains(5) == true);
+    CHECK(sl.contains(3) == true);
+    CHECK(sl.contains(8) == true);
+    CHECK(sl.contains(1) == true);
+    CHECK(sl.contains(9) == true);
+    CHECK(sl.contains(100) == false);
+    CHECK(sl.contains(0) == false);
+    CHECK(sl.size() == 5);
+
+    CHECK(sl.insert(5, "FIVE-DUP") == false);
+    CHECK(sl.size() == 5);
+
+    CHECK(sl.remove(3) == true);
+    CHECK(sl.contains(3) == false);
+    CHECK(sl.remove(3) == false);
+    CHECK(sl.remove(42) == false);
+    CHECK(sl.size() == 4);
+
+    std::vector<int> seen;
+    sl.forEach([&](const int& k, const std::string&) { seen.push_back(k); });
+    CHECK(std::is_sorted(seen.begin(), seen.end()));
+    CHECK((seen == std::vector<int>{1, 5, 8, 9}));
+
+    CHECK(sl.remove(1) == true);
+    CHECK(sl.remove(5) == true);
+    CHECK(sl.remove(8) == true);
+    CHECK(sl.remove(9) == true);
+    CHECK(sl.size() == 0);
+    CHECK(sl.contains(1) == false);
+
+    CHECK(sl.insert(42, "answer") == true);
+    CHECK(sl.contains(42) == true);
+    CHECK(sl.size() == 1);
+
+    std::cout << "[1] single-threaded basic: OK\n";
+}
+
+void test_single_threaded_random() {
+    LockFreeSkipList<int, int> sl;
+    std::set<int> oracle;
+    std::mt19937 gen(12345);
+    std::uniform_int_distribution<int> keyDist(0, 5000);
+
+    for (int i = 0; i < 20000; ++i) {
+        int k = keyDist(gen);
+        int op = gen() % 3;
+        if (op == 0) CHECK(sl.insert(k, k * 2) == oracle.insert(k).second);
+        else if (op == 1) CHECK(sl.remove(k) == (oracle.erase(k) > 0));
+        else CHECK(sl.contains(k) == (oracle.count(k) > 0));
+    }
+    CHECK(sl.size() == oracle.size());
+    for (int k : oracle) CHECK(sl.contains(k));
+    std::cout << "[1] randomized oracle cross-check (" << oracle.size() << " keys): OK\n";
+}
+
+void test_concurrent_disjoint_ranges() {
+    LockFreeSkipList<int, int> sl;
+    const int numThreads = 8;
+    const int perThread = 5000;
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&sl, t, perThread]() {
+            int base = t * perThread;
+            for (int i = 0; i < perThread; ++i) sl.insert(base + i, base + i);
+        });
+    }
+    for (auto& th : threads) th.join();
+    CHECK(sl.size() == static_cast<size_t>(numThreads * perThread));
+
+    std::atomic<int> mismatches{0};
+    threads.clear();
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&sl, &mismatches, numThreads, perThread]() {
+            for (int k = 0; k < numThreads * perThread; ++k)
+                if (!sl.contains(k)) mismatches.fetch_add(1);
+        });
+    }
+    for (auto& th : threads) th.join();
+    CHECK(mismatches.load() == 0);
+
+    threads.clear();
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&sl, t, perThread]() {
+            int base = t * perThread;
+            for (int i = 0; i < perThread; ++i) CHECK(sl.remove(base + i) == true);
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    CHECK(sl.size() == 0);
+    for (int k = 0; k < numThreads * perThread; ++k) CHECK(!sl.contains(k));
+
+    std::cout << "[2] concurrent disjoint-range stress: OK\n";
+}
+
+void test_concurrent_shared_keyspace() {
+    LockFreeSkipList<int, int> sl;
+    const int numThreads = 8;
+    const int opsPerThread = 8000;
+    const int keySpace = 200;
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            std::mt19937 gen(1000 + t);
+            std::uniform_int_distribution<int> keyDist(0, keySpace - 1);
+            std::uniform_int_distribution<int> opDist(0, 2);
+            for (int i = 0; i < opsPerThread; ++i) {
+                int k = keyDist(gen);
+                int op = opDist(gen);
+                if (op == 0) sl.insert(k, k);
+                else if (op == 1) sl.remove(k);
+                else sl.contains(k);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    std::vector<int> traversal;
+    sl.forEach([&](const int& k, const int&) { traversal.push_back(k); });
+    CHECK(std::is_sorted(traversal.begin(), traversal.end()));
+    std::unordered_set<int> uniq(traversal.begin(), traversal.end());
+    CHECK(uniq.size() == traversal.size());
+    CHECK(traversal.size() == sl.size());
+    for (int k : traversal) CHECK(sl.contains(k));
+
+    std::cout << "[3] concurrent shared-keyspace mixed workload, final size=" << sl.size() << ": OK\n";
+}
+
+void test_aba_stress() {
+    LockFreeSkipList<int, int> sl;
+    const int numThreads = 16;
+    const int iterations = 20000;
+    std::atomic<int> successfulInserts{0};
+    std::atomic<int> successfulRemoves{0};
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < iterations; ++i) {
+                if (sl.insert(777, i)) successfulInserts.fetch_add(1, std::memory_order_relaxed);
+                if (sl.remove(777)) successfulRemoves.fetch_add(1, std::memory_order_relaxed);
+                sl.contains(777);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    bool finalPresent = sl.contains(777);
+    CHECK(successfulInserts.load() == successfulRemoves.load() + (finalPresent ? 1 : 0));
+
+    while (sl.remove(777)) {}
+    CHECK(sl.contains(777) == false);
+    CHECK(sl.size() == 0);
+
+    std::cout << "[4] ABA/reclamation stress, " << successfulInserts.load() << " inserts: OK\n";
+}
+
+void run_tests() {
+    auto t0 = std::chrono::steady_clock::now();
+
+    test_single_threaded_basic();
+    test_single_threaded_random();
+    test_concurrent_disjoint_ranges();
+    test_concurrent_shared_keyspace();
+    test_aba_stress();
+
+    auto t1 = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    int passed = g_pass.load();
+    int failed = g_fail.load();
+    std::cout << "\nPassed: " << passed << "  Failed: " << failed
+              << "  (" << (100.0 * passed / (passed + failed)) << "%)"
+              << "  in " << secs << "s\n";
+}
+
+struct WorkloadMix { const char* name; double pContains; double pInsert; };
+
+static const WorkloadMix WORKLOADS[] = {
+    {"read-heavy (90/5/5)", 0.90, 0.05},
+    {"balanced   (50/25/25)", 0.50, 0.25},
+    {"write-heavy(10/45/45)", 0.10, 0.45},
+};
+static const int THREAD_COUNTS[] = {1, 2, 4, 8, 16};
+static const double TRIAL_SECONDS = 1.0;
+static const int KEY_SPACE = 100000;
+
+class MutexSet {
+public:
+    bool insert(int key, int) { std::lock_guard<std::mutex> lk(m_); return s_.insert(key).second; }
+    bool remove(int key) { std::lock_guard<std::mutex> lk(m_); return s_.erase(key) > 0; }
+    bool contains(int key) const { std::lock_guard<std::mutex> lk(m_); return s_.count(key) > 0; }
+private:
+    std::set<int> s_;
+    mutable std::mutex m_;
+};
+
+struct TrialResult {
+    long long totalOps = 0;
+    double seconds = 0;
+    double opsPerSec() const { return seconds > 0 ? totalOps / seconds : 0; }
+};
+
+template <typename Container>
+TrialResult runTrial(Container& c, int numThreads, const WorkloadMix& mix, double seconds) {
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    std::vector<long long> perThreadOps(numThreads, 0);
+
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            std::mt19937 gen(2024 + t * 7919);
+            std::uniform_int_distribution<int> keyDist(0, KEY_SPACE - 1);
+            std::uniform_real_distribution<double> opDist(0.0, 1.0);
+            long long ops = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                int key = keyDist(gen);
+                double r = opDist(gen);
+                if (r < mix.pContains) c.contains(key);
+                else if (r < mix.pContains + mix.pInsert) c.insert(key, key);
+                else c.remove(key);
+                ++ops;
+                if ((ops & 0xFFF) == 0 && stop.load(std::memory_order_relaxed)) break;
+            }
+            perThreadOps[t] = ops;
+        });
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& th : threads) th.join();
+    auto t1 = std::chrono::steady_clock::now();
+
+    TrialResult r;
+    r.seconds = std::chrono::duration<double>(t1 - t0).count();
+    for (auto v : perThreadOps) r.totalOps += v;
+    return r;
+}
+
+template <typename Container>
+void prepopulate(Container& c, int n) {
+    std::mt19937 gen(42);
+    std::uniform_int_distribution<int> keyDist(0, KEY_SPACE - 1);
+    int inserted = 0;
+    while (inserted < n) if (c.insert(keyDist(gen), 0)) ++inserted;
+}
+
+void printBar(double value, double maxValue, int width = 40) {
+    int filled = maxValue > 0 ? static_cast<int>(width * value / maxValue) : 0;
+    std::cout << "[";
+    for (int i = 0; i < width; ++i) std::cout << (i < filled ? '#' : ' ');
+    std::cout << "]";
+}
+
+void run_benchmark() {
+    std::cout << "\nBenchmark: key space " << KEY_SPACE << ", " << TRIAL_SECONDS << "s trials\n";
+
+    for (const auto& mix : WORKLOADS) {
+        std::cout << "\n=== Workload: " << mix.name << " ===\n";
+        for (int nt : THREAD_COUNTS) {
+            LockFreeSkipList<int, int> lockfreeList;
+            LockedSkipList<int, int> lockedList;
+            MutexSet mutexSet;
+
+            prepopulate(lockfreeList, KEY_SPACE / 2);
+            prepopulate(lockedList, KEY_SPACE / 2);
+            prepopulate(mutexSet, KEY_SPACE / 2);
+
+            TrialResult rLockFree = runTrial(lockfreeList, nt, mix, TRIAL_SECONDS);
+            TrialResult rLocked = runTrial(lockedList, nt, mix, TRIAL_SECONDS);
+            TrialResult rMutexSet = runTrial(mutexSet, nt, mix, TRIAL_SECONDS);
+
+            double maxOps = std::max({rLockFree.opsPerSec(), rLocked.opsPerSec(), rMutexSet.opsPerSec()});
+
+            std::cout << "\nThreads = " << nt << "\n";
+            std::printf("  lock-free skiplist : %12.0f ops/s  ", rLockFree.opsPerSec());
+            printBar(rLockFree.opsPerSec(), maxOps);
+            std::cout << "\n";
+            std::printf("  locked   skiplist   : %12.0f ops/s  ", rLocked.opsPerSec());
+            printBar(rLocked.opsPerSec(), maxOps);
+            std::cout << "\n";
+            std::printf("  std::set + mutex    : %12.0f ops/s  ", rMutexSet.opsPerSec());
+            printBar(rMutexSet.opsPerSec(), maxOps);
+            std::cout << "\n";
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    bool bench = argc > 1 && std::string(argv[1]) == "bench";
+    run_tests();
+    if (bench) run_benchmark();
+    return g_fail.load() == 0 ? 0 : 1;
+}
