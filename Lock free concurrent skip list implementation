@@ -1,0 +1,554 @@
+from __future__ import annotations
+
+import random
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Optional, List
+
+
+MAX_LEVEL = 16
+P = 0.5
+
+
+def _random_level() -> int:
+    level = 1
+    while random.random() < P and level < MAX_LEVEL:
+        level += 1
+    return level
+
+
+class Node:
+
+    __slots__ = ("key", "value", "next", "marked", "fully_linked", "lock", "top_level")
+
+    def __init__(self, key, value, level: int):
+        self.key = key
+        self.value = value
+        self.next: List[Optional["Node"]] = [None] * level
+        self.marked = False
+        self.fully_linked = False
+        self.lock = threading.Lock()
+
+
+        self.top_level = level - 1
+
+    def cas_next(self, level: int, expected: Optional["Node"], new: Optional["Node"]) -> bool:
+        with self.lock:
+            if self.next[level] is expected:
+                self.next[level] = new
+                return True
+            return False
+
+
+class _NegInf:
+    def __lt__(self, other): return True
+    def __le__(self, other): return True
+    def __gt__(self, other): return False
+    def __ge__(self, other): return other is self
+    def __eq__(self, other): return other is self
+    def __repr__(self): return "-inf"
+    def __hash__(self): return hash("_NegInf_sentinel")
+
+
+class _PosInf:
+    def __lt__(self, other): return False
+    def __le__(self, other): return other is self
+    def __gt__(self, other): return True
+    def __ge__(self, other): return True
+    def __eq__(self, other): return other is self
+    def __repr__(self): return "+inf"
+    def __hash__(self): return hash("_PosInf_sentinel")
+
+
+NEG_INF = _NegInf()
+POS_INF = _PosInf()
+
+
+class ConcurrentSkipList:
+
+    def __init__(self, max_level: int = MAX_LEVEL):
+        self.max_level = max_level
+        self.head = Node(NEG_INF, None, max_level)
+        self.tail = Node(POS_INF, None, max_level)
+        for i in range(max_level):
+            self.head.next[i] = self.tail
+        self.head.fully_linked = True
+        self.tail.fully_linked = True
+
+
+        self._size = 0
+        self._size_lock = threading.Lock()
+
+
+    def _find(self, key, preds: List[Node], succs: List[Node]) -> int:
+        found_level = -1
+        pred = self.head
+        for level in range(self.max_level - 1, -1, -1):
+            curr = pred.next[level]
+            while curr.key < key:
+                pred = curr
+                curr = pred.next[level]
+            if found_level == -1 and curr.key == key and not curr.marked:
+                found_level = level
+            preds[level] = pred
+            succs[level] = curr
+        return found_level
+
+
+    def contains(self, key) -> bool:
+        pred = self.head
+        for level in range(self.max_level - 1, -1, -1):
+            curr = pred.next[level]
+            while curr.key < key:
+                pred = curr
+                curr = pred.next[level]
+            if curr.key == key:
+                return (not curr.marked) and curr.fully_linked
+        return False
+
+    def get(self, key) -> Any:
+        pred = self.head
+        for level in range(self.max_level - 1, -1, -1):
+            curr = pred.next[level]
+            while curr.key < key:
+                pred = curr
+                curr = pred.next[level]
+            if curr.key == key and not curr.marked and curr.fully_linked:
+                return curr.value
+        return None
+
+    def insert(self, key, value) -> bool:
+        top_level = _random_level()
+        preds: List[Optional[Node]] = [None] * self.max_level
+        succs: List[Optional[Node]] = [None] * self.max_level
+
+        while True:
+            found_level = self._find(key, preds, succs)
+            if found_level != -1:
+                existing = succs[found_level]
+                if not existing.marked:
+
+
+                    existing.value = value
+                    return False
+
+                continue
+
+            new_node = Node(key, value, top_level)
+            for level in range(top_level):
+                new_node.next[level] = succs[level]
+
+
+            pred0, succ0 = preds[0], succs[0]
+            if not pred0.cas_next(0, succ0, new_node):
+                continue
+
+
+            for level in range(1, top_level):
+                while True:
+                    pred, succ = preds[level], succs[level]
+                    new_node.next[level] = succ
+                    if pred.cas_next(level, succ, new_node):
+                        break
+
+                    self._find(key, preds, succs)
+
+            new_node.fully_linked = True
+            with self._size_lock:
+                self._size += 1
+            return True
+
+    def delete(self, key) -> bool:
+        preds: List[Optional[Node]] = [None] * self.max_level
+        succs: List[Optional[Node]] = [None] * self.max_level
+
+        while True:
+            found_level = self._find(key, preds, succs)
+            if found_level == -1:
+                return False
+
+            victim = succs[found_level]
+            if victim.marked or not victim.fully_linked:
+                return False
+
+
+            with victim.lock:
+                if victim.marked:
+                    return False
+                victim.marked = True
+
+
+            for level in range(victim.top_level, -1, -1):
+                while True:
+                    pred = preds[level]
+                    if pred.next[level] is victim:
+                        if pred.cas_next(level, victim, victim.next[level]):
+                            break
+                        else:
+                            self._find(key, preds, succs)
+                    else:
+                        break
+
+            with self._size_lock:
+                self._size -= 1
+            return True
+
+    def __len__(self) -> int:
+        return self._size
+
+    def to_sorted_list(self) -> List[Any]:
+        result = []
+        curr = self.head.next[0]
+        while curr is not self.tail:
+            if not curr.marked and curr.fully_linked:
+                result.append((curr.key, curr.value))
+            curr = curr.next[0]
+        return result
+
+    def is_sorted_and_consistent(self) -> bool:
+        keys = [k for k, _ in self.to_sorted_list()]
+        return all(keys[i] < keys[i + 1] for i in range(len(keys) - 1))
+
+
+import random
+import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+
+class TestSequentialCorrectness(unittest.TestCase):
+    def setUp(self):
+        self.sl = ConcurrentSkipList()
+
+    def test_insert_and_contains(self):
+        self.assertTrue(self.sl.insert(5, "five"))
+        self.assertTrue(self.sl.contains(5))
+        self.assertFalse(self.sl.contains(6))
+
+    def test_insert_duplicate_updates_value(self):
+        self.assertTrue(self.sl.insert(1, "a"))
+        self.assertFalse(self.sl.insert(1, "b"))
+        self.assertEqual(self.sl.get(1), "b")
+
+    def test_delete_existing(self):
+        self.sl.insert(3, "three")
+        self.assertTrue(self.sl.delete(3))
+        self.assertFalse(self.sl.contains(3))
+
+    def test_delete_nonexistent(self):
+        self.assertFalse(self.sl.delete(999))
+
+    def test_sorted_order(self):
+        values = [50, 10, 40, 20, 30, 5, 45]
+        for v in values:
+            self.sl.insert(v, str(v))
+        self.assertEqual([k for k, _ in self.sl.to_sorted_list()], sorted(values))
+
+    def test_len_tracks_inserts_and_deletes(self):
+        for i in range(100):
+            self.sl.insert(i, i)
+        self.assertEqual(len(self.sl), 100)
+        for i in range(0, 100, 2):
+            self.sl.delete(i)
+        self.assertEqual(len(self.sl), 50)
+
+    def test_structural_invariant_after_many_ops(self):
+        keys = list(range(500))
+        random.shuffle(keys)
+        for k in keys:
+            self.sl.insert(k, k)
+        random.shuffle(keys)
+        for k in keys[:250]:
+            self.sl.delete(k)
+        self.assertTrue(self.sl.is_sorted_and_consistent())
+
+
+class TestConcurrentCorrectness(unittest.TestCase):
+
+    def test_concurrent_inserts_no_loss_no_duplicates(self):
+        sl = ConcurrentSkipList()
+        n_threads = 16
+        keys_per_thread = 500
+        total_keys = n_threads * keys_per_thread
+
+        def worker(tid):
+            for i in range(keys_per_thread):
+                key = tid * keys_per_thread + i
+                sl.insert(key, key * 10)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(sl), total_keys)
+        pairs = sl.to_sorted_list()
+        keys = [k for k, _ in pairs]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(len(keys), len(set(keys)))
+        for k, v in pairs:
+            self.assertEqual(v, k * 10)
+
+    def test_concurrent_insert_and_delete_disjoint_sets(self):
+        sl = ConcurrentSkipList()
+        n = 4000
+        for i in range(n):
+            sl.insert(i, i)
+
+        to_delete = set(range(0, n, 2))
+        to_keep = set(range(1, n, 2))
+
+        def deleter():
+            for k in to_delete:
+                sl.delete(k)
+
+        def inserter():
+            for k in range(n, n + 2000):
+                sl.insert(k, k)
+
+        threads = [threading.Thread(target=deleter) for _ in range(4)]
+        threads += [threading.Thread(target=inserter) for _ in range(4)]
+        random.shuffle(threads)
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        remaining = set(k for k, _ in sl.to_sorted_list())
+
+        self.assertTrue(remaining.isdisjoint(to_delete))
+
+        self.assertTrue(to_keep.issubset(remaining))
+        self.assertTrue(sl.is_sorted_and_consistent())
+
+    def test_concurrent_mixed_workload_stress(self):
+        sl = ConcurrentSkipList()
+        key_space = 200
+        ops_per_thread = 3000
+        n_threads = 12
+
+        def worker():
+            rnd = random.Random()
+            for _ in range(ops_per_thread):
+                key = rnd.randrange(key_space)
+                choice = rnd.random()
+                if choice < 0.4:
+                    sl.insert(key, key)
+                elif choice < 0.7:
+                    sl.delete(key)
+                else:
+                    sl.contains(key)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertTrue(sl.is_sorted_and_consistent())
+        pairs = sl.to_sorted_list()
+        keys = [k for k, _ in pairs]
+        self.assertEqual(len(keys), len(set(keys)))
+        for k, v in pairs:
+            self.assertEqual(k, v)
+
+    def test_no_deadlock_under_thread_pool(self):
+        sl = ConcurrentSkipList()
+
+        def op(i):
+            sl.insert(i, i)
+            sl.contains(i)
+            if i % 3 == 0:
+                sl.delete(i)
+            return True
+
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            results = list(ex.map(op, range(5000)))
+        self.assertTrue(all(results))
+        self.assertTrue(sl.is_sorted_and_consistent())
+
+
+import random
+import threading
+import time
+from statistics import mean
+
+
+class CoarseLockSkipList:
+
+    def __init__(self):
+        self._sl = ConcurrentSkipList()
+        self._lock = threading.Lock()
+
+    def insert(self, k, v):
+        with self._lock:
+            return self._sl.insert(k, v)
+
+    def delete(self, k):
+        with self._lock:
+            return self._sl.delete(k)
+
+    def contains(self, k):
+        with self._lock:
+            return self._sl.contains(k)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._sl)
+
+
+class LockedDict:
+
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def insert(self, k, v):
+        with self._lock:
+            existed = k in self._d
+            self._d[k] = v
+            return not existed
+
+    def delete(self, k):
+        with self._lock:
+            if k in self._d:
+                del self._d[k]
+                return True
+            return False
+
+    def contains(self, k):
+        with self._lock:
+            return k in self._d
+
+    def __len__(self):
+        with self._lock:
+            return len(self._d)
+
+
+def run_workload(structure, n_threads, ops_per_thread, read_ratio, key_space):
+    barrier = threading.Barrier(n_threads)
+
+    def worker(seed):
+        rnd = random.Random(seed)
+        barrier.wait()
+        for _ in range(ops_per_thread):
+            key = rnd.randrange(key_space)
+            r = rnd.random()
+            if r < read_ratio:
+                structure.contains(key)
+            elif r < read_ratio + (1 - read_ratio) / 2:
+                structure.insert(key, key)
+            else:
+                structure.delete(key)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.perf_counter() - start
+
+    total_ops = n_threads * ops_per_thread
+    return total_ops / elapsed
+
+
+def main():
+    thread_counts = [1, 2, 4, 8, 16]
+    read_ratios = [0.9, 0.5, 0.1]
+    ops_per_thread = 4000
+    key_space = 2000
+    repeats = 3
+
+    implementations = {
+        "ConcurrentSkipList (fine-grained)": ConcurrentSkipList,
+        "CoarseLockSkipList (baseline)": CoarseLockSkipList,
+        "LockedDict (stdlib-style baseline)": LockedDict,
+    }
+
+    results = {}
+
+    for name, ctor in implementations.items():
+        results[name] = {}
+        for ratio in read_ratios:
+            results[name][ratio] = {}
+            for n_threads in thread_counts:
+                samples = []
+                for _ in range(repeats):
+                    structure = ctor()
+
+                    for i in range(key_space // 2):
+                        structure.insert(i, i)
+                    throughput = run_workload(
+                        structure, n_threads, ops_per_thread, ratio, key_space
+                    )
+                    samples.append(throughput)
+                results[name][ratio][n_threads] = mean(samples)
+
+    print_report(results, thread_counts, read_ratios)
+    write_ascii_charts(results, thread_counts, read_ratios)
+
+
+def print_report(results, thread_counts, read_ratios):
+    for name, by_ratio in results.items():
+        print(f"\n=== {name} ===")
+        for ratio in read_ratios:
+            print(f"  read_ratio={ratio}")
+            for n_threads in thread_counts:
+                tp = by_ratio[ratio][n_threads]
+                print(f"    threads={n_threads:>2}  throughput={tp:>10.0f} ops/sec")
+
+
+def write_ascii_charts(results, thread_counts, read_ratios, path="benchmark_results.txt"):
+    lines = []
+    lines.append("LOCK-FREE-STRUCTURED SKIP LIST -- BENCHMARK RESULTS (ASCII)")
+    lines.append("=" * 70)
+    lines.append("")
+    lines.append("Environment note: results reflect CPython + GIL scheduling")
+    lines.append("overhead, NOT true multicore scalability. See technical report.")
+    lines.append("")
+
+    for ratio in read_ratios:
+        lines.append(f"--- Read ratio = {ratio} (throughput in ops/sec, higher = better) ---")
+        max_tp = max(
+            results[name][ratio][t]
+            for name in results
+            for t in thread_counts
+        )
+        bar_width = 50
+        for name in results:
+            lines.append(f"\n{name}:")
+            for n_threads in thread_counts:
+                tp = results[name][ratio][n_threads]
+                bar_len = int((tp / max_tp) * bar_width) if max_tp > 0 else 0
+                bar = "#" * bar_len
+                lines.append(f"  {n_threads:>2} threads | {bar:<{bar_width}} {tp:>9.0f} ops/s")
+        lines.append("")
+
+    text = "\n".join(lines)
+    with open(path, "w") as f:
+        f.write(text)
+    print(f"\nWrote ASCII chart report to {path}")
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    mode = _sys.argv[1] if len(_sys.argv) > 1 else "all"
+
+    if mode in ("test", "all"):
+        print("=" * 70)
+        print("RUNNING CORRECTNESS + CONCURRENCY TEST SUITE")
+        print("=" * 70)
+        _suite = unittest.TestLoader().loadTestsFromModule(_sys.modules[__name__])
+        _runner = unittest.TextTestRunner(verbosity=2)
+        _result = _runner.run(_suite)
+        if not _result.wasSuccessful():
+            _sys.exit(1)
+
+    if mode in ("benchmark", "all"):
+        print("\n" + "=" * 70)
+        print("RUNNING THROUGHPUT BENCHMARK")
+        print("=" * 70)
+        main()
